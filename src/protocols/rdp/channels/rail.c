@@ -32,6 +32,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <guacamole/mem.h>
 
 #ifdef FREERDP_RAIL_CALLBACKS_REQUIRE_CONST
 /**
@@ -216,6 +217,198 @@ static UINT guac_rdp_rail_handshake_ex(RailClientContext* rail,
     return guac_rdp_rail_complete_handshake(rail);
 }
 
+static void guac_rdp_update_window(guac_client* client, guac_rdp_window* window,
+                                   RAIL_CONST WINDOW_ORDER_INFO* orderInfo,
+                                   RAIL_CONST WINDOW_STATE_ORDER* window_state) {
+    guac_client_log(client, GUAC_LOG_INFO, "Updating window %d", window->windowId);
+    const UINT32 fieldFlags = orderInfo->fieldFlags;
+    if (fieldFlags & WINDOW_ORDER_FIELD_OWNER) {
+        window->ownerWindowId = guac_mem_alloc(sizeof(UINT32));
+        *window->ownerWindowId = window_state->ownerWindowId;
+    }
+    if (fieldFlags & WINDOW_ORDER_FIELD_STYLE) {
+        window->style = guac_mem_alloc(sizeof(UINT32));
+        *window->style = window_state->style;
+    }
+    if (fieldFlags & WINDOW_ORDER_FIELD_SHOW) {
+        window->showState = guac_mem_alloc(sizeof(UINT32));
+        *window->showState = window_state->showState;
+    }
+}
+
+static guac_rdp_window* guac_rdp_make_window(guac_client* client, UINT32 windowId,
+                                             RAIL_CONST WINDOW_ORDER_INFO* orderInfo,
+                                             RAIL_CONST WINDOW_STATE_ORDER* window_state
+) {
+    guac_client_log(client, GUAC_LOG_INFO, "Creating window %d", windowId);
+
+    guac_rdp_window* window = guac_mem_alloc(sizeof(guac_rdp_window));
+    window->windowId = windowId;
+
+    guac_rdp_update_window(client, window, orderInfo, window_state);
+
+    return window;
+}
+
+static void guac_rdp_add_window_to_list(guac_client* client, guac_common_list* windows, guac_rdp_window* window) {
+    guac_client_log(client, GUAC_LOG_INFO, "Adding window %d to window list");
+    guac_common_list_lock(windows);
+    guac_common_list_add(windows, window);
+    guac_common_list_unlock(windows);
+    guac_client_log(client, GUAC_LOG_INFO, "End adding window %d to window list", window->windowId);
+}
+
+static void guac_rdp_remove_window_from_list(guac_client* client, guac_common_list* windows,
+                                             guac_common_list_element* element) {
+    guac_common_list_lock(windows);
+    guac_common_list_remove(windows, element);
+    guac_common_list_unlock(windows);
+}
+
+static guac_common_list_element* guac_rdp_found_window(guac_common_list* windows, UINT32 windowId) {
+    guac_common_list_lock(windows);
+    guac_common_list_element* find = NULL;
+    for (guac_common_list_element* element = windows->head; element != NULL; element = element->next) {
+        guac_rdp_window* data = element->data;
+        if (data->windowId == windowId) {
+            find = element;
+        }
+    }
+    guac_common_list_unlock(windows);
+
+    return find;
+}
+
+static BOOL guac_rdp_window_create(rdpContext* context, RAIL_CONST WINDOW_ORDER_INFO* orderInfo,
+                                   RAIL_CONST WINDOW_STATE_ORDER* window_state) {
+    guac_client* client = ((rdp_freerdp_context *) context)->client;
+    guac_rdp_client* rdp_client = client->data;
+
+    const UINT32 windowId = orderInfo->windowId;
+
+    guac_client_log(client, GUAC_LOG_INFO, "A window %d was created", orderInfo->windowId);
+    if (rdp_client->windows == NULL) {
+        rdp_client->windows = guac_common_list_alloc();
+    }
+
+    guac_common_list* windows = rdp_client->windows;
+
+    guac_rdp_window* window = guac_rdp_make_window(client, windowId, orderInfo, window_state);
+    guac_rdp_add_window_to_list(client, windows, window);
+    guac_client_log(client, GUAC_LOG_INFO, "End creating window %d", windowId);
+
+    return TRUE;
+}
+
+static BOOL guac_rdp_window_update(rdpContext* context, RAIL_CONST WINDOW_ORDER_INFO* orderInfo,
+                                   RAIL_CONST WINDOW_STATE_ORDER* window_state) {
+    guac_client* client = ((rdp_freerdp_context *) context)->client;
+    guac_rdp_client* rdp_client = client->data;
+    RailClientContext* rail = freerdp_channels_get_static_channel_interface(context->channels, "rail");
+    guac_common_list* windows = rdp_client->windows;
+
+    const UINT32 windowId = orderInfo->windowId;
+
+    guac_client_log(client, GUAC_LOG_INFO, "A window %d was updated", orderInfo->windowId);
+
+    guac_common_list_element* element = guac_rdp_found_window(windows, orderInfo->windowId);
+    if (element == NULL) {
+        guac_client_log(client, GUAC_LOG_WARNING, "The given window %d is not in the list, creating it", windowId);
+        guac_rdp_window_create(context, orderInfo, window_state);
+        element = guac_rdp_found_window(windows, orderInfo->windowId);
+    } else {
+        guac_rdp_window *window = element->data;
+        guac_rdp_update_window(client, window, orderInfo, window_state);
+    }
+
+    guac_rdp_window* window = element->data;
+
+    if (window->ownerWindowId == NULL || window->showState == NULL || window->style == NULL) {
+        return TRUE;
+    }
+
+    if (*window->ownerWindowId != 0) {
+        guac_client_log(client, GUAC_LOG_WARNING, "The given window %d has an owner, skipping SC_MAXIMIZE command",
+                        windowId);
+        return TRUE;
+    }
+    if (*window->showState == WINDOW_SHOW_MAXIMIZED) {
+        guac_client_log(client, GUAC_LOG_WARNING,
+                        "The given window %d is already maximized, skipping SC_MAXIMIZE command", windowId);
+        return TRUE;
+    }
+
+    if (!(*window->style & WS_OVERLAPPEDWINDOW)) {
+        guac_client_log(client, GUAC_LOG_WARNING,
+                        "The given window %d is not a top level window, skipping SC_MAXIMIZE command", windowId);
+        return TRUE;
+    }
+
+    const RAIL_SYSCOMMAND_ORDER command = {
+        .windowId = windowId,
+        .command = SC_MAXIMIZE,
+    };
+
+    guac_client_log(client, GUAC_LOG_INFO, "Sending SC_MAXIMIZE command to window ID: %d", windowId);
+
+    pthread_mutex_lock(&(rdp_client->message_lock));
+    const UINT status = rail->ClientSystemCommand(rail, &command);
+    pthread_mutex_unlock(&(rdp_client->message_lock));
+
+    guac_client_log(client, GUAC_LOG_INFO, "Done sending SC_MAXIMIZE command to window ID: %d", windowId);
+
+    return status == CHANNEL_RC_OK;
+}
+
+static BOOL guac_rdp_window_delete(rdpContext* context, RAIL_CONST WINDOW_ORDER_INFO* orderInfo) {
+    guac_client* client = ((rdp_freerdp_context*) context)->client;
+    guac_rdp_client* rdp_client = client->data;
+
+    const UINT32 windowId = orderInfo->windowId;
+
+    guac_client_log(client, GUAC_LOG_INFO, "A window %d was deleted", orderInfo->windowId);
+
+    guac_common_list_element* element = guac_rdp_found_window(rdp_client->windows, windowId);
+
+    if (element == NULL) {
+        guac_client_log(client, GUAC_LOG_WARNING, "The given window %d is not in the list", windowId);
+        return TRUE;
+    }
+
+    guac_rdp_remove_window_from_list(client, rdp_client->windows, element);
+    return TRUE;
+}
+
+static void free_window(void* data) {
+    guac_rdp_window* window = data;
+    if (window == NULL) {
+        return;
+    }
+
+    free(window->ownerWindowId);
+    free(window->style);
+    free(window->showState);
+    free(window);
+}
+
+static void guac_rdp_windows_free(guac_common_list** windows) {
+    if (windows == NULL) {
+        return;
+    }
+    guac_common_list_free(*windows, free_window);
+    *windows = NULL;
+}
+
+static void guac_rdp_rail_register_window_handlers(guac_client* client, freerdp* rdp_inst) {
+    guac_rdp_client* rdp_client = client->data;
+    guac_client_log(client, GUAC_LOG_INFO, "Registering window handlers on RAIL mode.");
+    rdp_inst->update->window->WindowCreate = guac_rdp_window_create;
+    rdp_inst->update->window->WindowUpdate = guac_rdp_window_update;
+    rdp_inst->update->window->WindowDelete = guac_rdp_window_delete;
+    rdp_client->free_windows = guac_rdp_windows_free;
+    guac_client_log(client, GUAC_LOG_INFO, "Done registering window handlers on RAIL mode.");
+}
+
 /**
  * Callback which associates handlers specific to Guacamole with the
  * RailClientContext instance allocated by FreeRDP to deal with received
@@ -252,6 +445,8 @@ static void guac_rdp_rail_channel_connected(rdpContext* context,
     rail->custom = client;
     rail->ServerHandshake = guac_rdp_rail_handshake;
     rail->ServerHandshakeEx = guac_rdp_rail_handshake_ex;
+
+    guac_rdp_rail_register_window_handlers(client, context->instance);
 
     guac_client_log(client, GUAC_LOG_DEBUG, "RAIL (RemoteApp) channel "
             "connected.");

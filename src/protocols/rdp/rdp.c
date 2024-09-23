@@ -669,6 +669,11 @@ static int guac_rdp_handle_connection(guac_client* client) {
     guac_common_display_free(rdp_client->display);
     rdp_client->display = NULL;
 
+    /* Free window list */
+    if (rdp_client->free_windows != NULL) {
+        rdp_client->free_windows(&rdp_client->windows);
+    }
+
     guac_rwlock_release_lock(&(rdp_client->lock));
 
     /* Client is now disconnected */

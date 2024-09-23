@@ -52,10 +52,29 @@
 #include <stdint.h>
 
 /**
+ * RDP Window
+ */
+typedef struct guac_rdp_window {
+ UINT32 windowId;
+ UINT32* ownerWindowId;
+ UINT32* style;
+ UINT32* showState;
+} guac_rdp_window;
+
+typedef void (*pFreeWindows)(guac_common_list**);
+
+/**
  * RDP-specific client data.
  */
 typedef struct guac_rdp_client {
-
+    /**
+     * The all windows in the current session.
+     */
+    guac_common_list* windows;
+    /**
+     * Free windows
+     */
+    pFreeWindows free_windows;
     /**
      * The RDP client thread.
      */
